@@ -208,6 +208,7 @@ def top_hat_extraction(image):
     return max_top_hat
 
 # ========================= SHADE CORRECTED FEATURE EXTRACTION ==========================
+
 def SC_extraction(image):
     G_clahe_median = cv2.medianBlur(image, 25)
 
@@ -216,6 +217,26 @@ def SC_extraction(image):
     SC_feature = SC_normalized.astype(np.uint8)
 
     return SC_feature                                                                                                                                                                                                                                           
+
+# ========================= FEATURE VECTOR CREATION ==========================
+
+def create_feature_vector(gabor_features, G_channel,th_feature, sc_feature):
+    """
+    Create feature vector by stacking
+    Gabor features, TH feature, and SC feature for one image.
+    """
+    feature_vector = []
+    
+    for gabor in gabor_features:
+        feature_vector.append(gabor.flatten())
+    
+    feature_vector.append(G_channel.flatten())
+    feature_vector.append(th_feature.flatten())
+    feature_vector.append(sc_feature.flatten())
+    
+    feature_vector = np.stack(feature_vector, axis=1)  # Shape: (num_pixels, num_features)
+    
+    return feature_vector
 
 # ========================== MAIN PIPELINE ==========================
 
@@ -386,6 +407,23 @@ def extract_sc_features(preprocessed_train, preprocessed_test):
     
     return sc_train, sc_test
 
+def create_feature_vector_dataset(gabor_train, th_train, sc_train, gabor_test, th_test, sc_test, G_channel_train, G_channel_test):
+    """Create feature vectors for entire dataset."""
+    feature_vectors_train = []
+    feature_vectors_test = []
+    
+    print("Creating feature vectors for train data...")
+    for gabor_features, th_feature, sc_feature, G_channel in zip(gabor_train, th_train, sc_train, G_channel_train):
+        feature_vector = create_feature_vector(gabor_features, G_channel, th_feature, sc_feature)
+        feature_vectors_train.append(feature_vector)
+    
+    print("Creating feature vectors for test data...")
+    for gabor_features, th_feature, sc_feature, G_channel in zip(gabor_test, th_test, sc_test, G_channel_test):
+        feature_vector = create_feature_vector(gabor_features, G_channel, th_feature, sc_feature)
+        feature_vectors_test.append(feature_vector)
+    
+    return feature_vectors_train, feature_vectors_test
+    
 # ========================= SAVING FIGURES ==========================
 
 def save_fig3(G_channel, Y_channel, L_channel, save_path):
@@ -529,10 +567,12 @@ def main():
     #extract SC features
     sc_train, sc_test = extract_sc_features(preprocessed_train, preprocessed_test)
 
+    #Create feature vectors 
+    g_clahe = [item[5] for item in preprocessed_train]
+    g_clahe_test = [item[5] for item in preprocessed_test]
+    feature_vectors_train, feature_vectors_test = create_feature_vector_dataset(gabor_train, th_train, sc_train,gabor_test, th_test, sc_test,g_clahe, g_clahe_test)
 
-
-
-
+    
 
 
 if __name__ == "__main__":
