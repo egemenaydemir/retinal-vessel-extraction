@@ -172,6 +172,50 @@ def binarize_gabor_features(gabor_features):
         binary_features.append(binary)
     
     return binary_features
+# ========================= TOP-HAT EXTRACTION ==========================
+
+def create_line_kernel(length, angle):
+    """Create a line structuring element."""
+    angle_rad = np.deg2rad(angle)
+    x = int((length - 1) * np.cos(angle_rad))
+    y = int((length - 1) * np.sin(angle_rad))
+    kernel = np.zeros((length, length), dtype=np.uint8)
+    cv2.line(kernel, (length // 2 - x // 2, length // 2 - y // 2), (length // 2 + x // 2, length // 2 + y // 2), 1, thickness=1) # Draw line in the kernel
+    return kernel
+
+def top_hat_extraction(image):
+    inverted_G_clahe = invert_image(image)
+
+    angles = np.arange(0,180,22.5) #nine angles from 0 to 157.5
+    structuring_elements = []
+    for angle in angles:
+        kernel = create_line_kernel(length=21, angle=angle)
+        structuring_elements.append(kernel)
+
+    oppened_images = []
+    for se in structuring_elements:
+        opened = cv2.morphologyEx(inverted_G_clahe, cv2.MORPH_OPEN, se)
+        oppened_images.append(opened)
+
+    top_hat_images = []
+    for opened in oppened_images:
+        top_hat = cv2.subtract(inverted_G_clahe, opened)
+        top_hat_images.append(top_hat)
+
+    #take pixel-wise maximum of opened images
+    max_top_hat = np.maximum.reduce(top_hat_images)
+
+    return max_top_hat
+
+# ========================= SHADE CORRECTED FEATURE EXTRACTION ==========================
+def SC_extraction(image):
+    G_clahe_median = cv2.medianBlur(image, 25)
+
+    diff = G_clahe_median.astype(np.float32) - image.astype(np.float32)
+    SC_normalized = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+    SC_feature = SC_normalized.astype(np.uint8)
+
+    return SC_feature                                                                                                                                                                                                                                           
 
 # ========================== MAIN PIPELINE ==========================
 
@@ -300,6 +344,48 @@ def automatic_thresholding_gabor(gabor_train, gabor_test):
 
     return binary_train, binary_test
 
+def extract_th_features(preprocessed_train, preprocessed_test):
+    """Extract TH features for entire dataset."""
+
+    print("Extracting TH features for train data...")
+    th_train = []
+    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_train):
+        TH_feature = top_hat_extraction(G_clahe)
+        th_train.append(TH_feature)
+
+        save_fig7(TH_feature, f"results/fig7/train_fig7_{idx+21}.png")
+
+    print("Extracting TH features for test data...")
+    th_test = []
+    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_test):
+        TH_feature = top_hat_extraction(G_clahe)
+        th_test.append(TH_feature)
+
+        save_fig7(TH_feature, f"results/fig7/test_fig7_{idx+1:02d}.png")
+    
+    return th_train, th_test
+
+def extract_sc_features(preprocessed_train, preprocessed_test):
+    """Extract SC features for entire dataset."""
+
+    print("Extracting SC features for train data...")
+    sc_train = []
+    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_train):
+        SC_feature = SC_extraction(G_clahe)
+        sc_train.append(SC_feature)
+
+        save_fig8(SC_feature, f"results/fig8/train_fig8_{idx+21}.png")
+
+    print("Extracting SC features for test data...")
+    sc_test = []
+    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_test):
+        SC_feature = SC_extraction(G_clahe)
+        sc_test.append(SC_feature)
+
+        save_fig8(SC_feature, f"results/fig8/test_fig8_{idx+1:02d}.png")
+    
+    return sc_train, sc_test
+
 # ========================= SAVING FIGURES ==========================
 
 def save_fig3(G_channel, Y_channel, L_channel, save_path):
@@ -400,6 +486,26 @@ def save_fig6(binary_G, binary_Y, binary_L, save_path):
     plt.savefig(save_path)
     plt.close()
 
+def save_fig7(TH_feature, save_path):
+    """Save figure of TH Feature."""
+    plt.figure(figsize=(6, 6))
+    plt.imshow(TH_feature, cmap='gray')
+    plt.title('TH Feature')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+def save_fig8(SC_feature, save_path):
+    """Save figure of SC Feature."""
+    plt.figure(figsize=(6, 6))
+    plt.imshow(SC_feature, cmap='gray')
+    plt.title('SC Feature')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # ========================== MAIN START ==========================
 
 def main():
@@ -412,13 +518,16 @@ def main():
     preprocessed_train, preprocessed_test = preprocess_dataset(train_images, train_masks, test_images, test_masks)
 
     #apply gabor filter
-    gabor_train , gabor_test = gabor_feature_extraction_dataset(preprocessed_train, preprocessed_test)
+    gray_gabor_train , gray_gabor_test = gabor_feature_extraction_dataset(preprocessed_train, preprocessed_test)
 
     #apply automatic thresholding to gabor images
-    binary_train, binary_test = automatic_thresholding_gabor(gabor_train, gabor_test)
+    gabor_train, gabor_test = automatic_thresholding_gabor(gray_gabor_train, gray_gabor_test)
 
+    #extract TH features
+    th_train, th_test = extract_th_features(preprocessed_train, preprocessed_test)
 
-
+    #extract SC features
+    sc_train, sc_test = extract_sc_features(preprocessed_train, preprocessed_test)
 
 
 
