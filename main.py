@@ -117,7 +117,11 @@ def gabor_filter_response(channel, wavelength, gamma=0.5, bandwidth=1, psi=0):
         filtered = cv2.filter2D(img_inverted, cv2.CV_64F, kernel)
         responses.append(filtered)
     
-    return np.max(responses, axis=0)
+    max_response = np.max(responses, axis=0)
+
+    max_response = np.maximum(0, max_response)  # Set negative values to zero
+    
+    return max_response
 
 def extract_gabor_features(G, Y, L, wavelengths=[9, 10, 11]): 
     """
@@ -130,6 +134,45 @@ def extract_gabor_features(G, Y, L, wavelengths=[9, 10, 11]):
             gabor_features.append(response)
 
     return gabor_features
+
+# ========================= AUTOMATIC THRESHOLDING ==========================
+
+def calculate_automatic_threshold(image):
+    """
+    Calculate automatic threshold using paper's formula:
+    T = Σ(i × Yi/(m×n)) for i=0 to 255
+    """
+    total_pixels = image.shape[0] * image.shape[1]
+    hist = cv2.calcHist([image], [0], None, [256], [0, 256]).flatten()
+    threshold = 0.0
+    for i in range(256):
+        threshold += i * (hist[i] / total_pixels)
+    
+    return threshold
+
+def binarize_gabor_features(gabor_features):
+    """
+    Binarize Gabor features.
+    
+    Laplacian enhancement + automatic threshold (paper method)
+    """
+    binary_features = []
+    
+    for gabor in gabor_features:
+
+        gabor_norm = cv2.normalize(gabor, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        laplacian = cv2.Laplacian(gabor_norm, cv2.CV_64F)
+        laplacian = laplacian.astype(np.uint8)
+        combined = (laplacian + gabor_norm).astype(np.uint8)
+        
+        # Calculate automatic threshold on combined image (using mask)
+        threshold = calculate_automatic_threshold(combined)
+        _, binary = cv2.threshold(combined, int(threshold), 255, cv2.THRESH_BINARY)
+        
+        binary_features.append(binary)
+    
+    return binary_features
+
 # ========================== MAIN PIPELINE ==========================
 
 def load_drive_dataset(data_path):
@@ -228,6 +271,34 @@ def gabor_feature_extraction_dataset(preprocessed_train, preprocessed_test):
     
     return gabor_train, gabor_test
 
+def automatic_thresholding_gabor(gabor_train, gabor_test):
+    """
+    Apply automatic thresholding to Gabor features for entire dataset.
+    """
+    
+    binary_train = []
+    binary_test = []
+
+    print("Applying automatic thresholding to train Gabor features...")
+    for idx, gabor_features in enumerate(gabor_train):
+        binary_features = binarize_gabor_features(gabor_features)
+        binary_train.append(binary_features)
+
+        # Save figure 6
+        save_fig6(binary_features[0:3], binary_features[3:6], binary_features[6:9],
+                   f"results/fig6/train_fig6_{idx+21}.png")
+
+
+    print("Applying automatic thresholding to test Gabor features...")
+    for idx, gabor_features in enumerate(gabor_test):
+        binary_features = binarize_gabor_features(gabor_features)
+        binary_test.append(binary_features)
+
+        # Save figure 6
+        save_fig6(binary_features[0:3], binary_features[3:6], binary_features[6:9],
+                   f"results/fig6/test_fig6_{idx+1:02d}.png")
+
+    return binary_train, binary_test
 
 # ========================= SAVING FIGURES ==========================
 
@@ -303,6 +374,32 @@ def save_fig5(Gabor_G, Gabor_Y, Gabor_L, save_path):
     plt.savefig(save_path)
     plt.close()
    
+def save_fig6(binary_G, binary_Y, binary_L, save_path):
+    """Save figure with Gabor filter responses for G, Y, L channels for 3 wavelengths after automatic thresholding."""
+    plt.figure(figsize=(12, 8))
+    
+    wavelengths = [9, 10, 11]
+    
+    for i, wavelength in enumerate(wavelengths):
+        plt.subplot(3, 3, i + 1)
+        plt.imshow(binary_G[i], cmap='gray')
+        plt.title(f'Gabor G - Wavelength {wavelength}')
+        plt.axis('off')
+        
+        plt.subplot(3, 3, i + 4)
+        plt.imshow(binary_Y[i], cmap='gray')
+        plt.title(f'Gabor Y - Wavelength {wavelength}')
+        plt.axis('off')
+        
+        plt.subplot(3, 3, i + 7)
+        plt.imshow(binary_L[i], cmap='gray')
+        plt.title(f'Gabor L - Wavelength {wavelength}')
+        plt.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # ========================== MAIN START ==========================
 
 def main():
@@ -314,10 +411,12 @@ def main():
     #apply preprocessing 
     preprocessed_train, preprocessed_test = preprocess_dataset(train_images, train_masks, test_images, test_masks)
 
-    #extract gabor features
+    #apply gabor filter
     gabor_train , gabor_test = gabor_feature_extraction_dataset(preprocessed_train, preprocessed_test)
 
-    
+    #apply automatic thresholding to gabor images
+    binary_train, binary_test = automatic_thresholding_gabor(gabor_train, gabor_test)
+
 
 
 
