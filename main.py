@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import roc_curve, auc
+from sklearn.preprocessing import StandardScaler
 import os
 import warnings
 import matplotlib
@@ -423,7 +424,38 @@ def create_feature_vector_dataset(gabor_train, th_train, sc_train, gabor_test, t
         feature_vectors_test.append(feature_vector)
     
     return feature_vectors_train, feature_vectors_test
+
+def apply_pca(feature_vectors_train, feature_vectors_test):
+    """Apply PCA to feature vectors."""
+    print("Applying PCA...")
+
+    # Stack per-image feature vectors into big arrays, remembering sizes to split back later
+    train_sizes = [fv.shape[0] for fv in feature_vectors_train]
+    test_sizes = [fv.shape[0] for fv in feature_vectors_test]
+
+    X_train = np.vstack(feature_vectors_train)
+    X_test = np.vstack(feature_vectors_test)
+
+    # Scale using training statistics, then transform test with same scaler
+    scaler = StandardScaler()
+    scaler.fit(X_train)
+    X_train_scaled = scaler.transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Apply PCA (keep 95% variance)
+    pca = PCA(n_components=12)
+    pca.fit(X_train_scaled)
+    X_train_pca_all = pca.transform(X_train_scaled)
+    X_test_pca_all = pca.transform(X_test_scaled)
+
+    # Split back into per-image arrays
+    train_split_idx = np.cumsum(train_sizes)[:-1]
+    test_split_idx = np.cumsum(test_sizes)[:-1]
+
+    X_train_pca = list(np.split(X_train_pca_all, train_split_idx, axis=0)) 
+    X_test_pca = list(np.split(X_test_pca_all, test_split_idx, axis=0)) 
     
+    return X_train_pca, X_test_pca
 # ========================= SAVING FIGURES ==========================
 
 def save_fig3(G_channel, Y_channel, L_channel, save_path):
@@ -572,7 +604,9 @@ def main():
     g_clahe_test = [item[5] for item in preprocessed_test]
     feature_vectors_train, feature_vectors_test = create_feature_vector_dataset(gabor_train, th_train, sc_train,gabor_test, th_test, sc_test,g_clahe, g_clahe_test)
 
-    
+    #PCA dimensionality reduction
+    X_train_pca, X_test_pca = apply_pca(feature_vectors_train, feature_vectors_test)
+
 
 
 if __name__ == "__main__":
