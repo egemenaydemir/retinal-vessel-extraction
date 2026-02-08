@@ -1,13 +1,11 @@
 import cv2
-import numpy as np
+import numpy as np 
 from sklearn.decomposition import PCA
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import StandardScaler
 import os
 import warnings
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
@@ -221,23 +219,68 @@ def SC_extraction(image):
 
 # ========================= FEATURE VECTOR CREATION ==========================
 
-def create_feature_vector(gabor_features, G_channel,th_feature, sc_feature):
+def create_feature_vector(gabor_features, G_clahe, th_feature, sc_feature):
     """
     Create feature vector by stacking
     Gabor features, TH feature, and SC feature for one image.
     """
-    feature_vector = []
-    
-    for gabor in gabor_features:
-        feature_vector.append(gabor.flatten())
-    
-    feature_vector.append(G_channel.flatten())
-    feature_vector.append(th_feature.flatten())
-    feature_vector.append(sc_feature.flatten())
-    
-    feature_vector = np.stack(feature_vector, axis=1)  # Shape: (num_pixels, num_features)
-    
+    feature_vector = np.stack([G_clahe] + gabor_features + [th_feature, sc_feature], axis=-1)
+    feature_vector = feature_vector.reshape(-1, feature_vector.shape[-1])
     return feature_vector
+
+# ========================= FUZZY C-MEANS CLUSTERING ==========================
+def fcm_clustering(X, n_clusters, m, max_iter, tol, seed):
+    """
+    Fuzzy C-Means clustering.
+
+    Parameters:
+    - X: Input data (num_samples, num_features)
+    - n_clusters: Number of clusters
+    - m: Fuzziness parameter
+    - max_iter: Maximum number of iterations
+    - tol: Tolerance for convergence
+    - seed: Random seed for reproducibility
+
+    Returns:
+    - centers: Cluster centers (n_clusters, num_features)
+    - membership: Membership matrix (num_samples, n_clusters)
+
+    """
+
+    if m <= 1:
+        raise ValueError("Fuzziness parameter m must be greater than 1.")
+    
+
+    rng = np.random.default_rng(seed)
+    num_samples, num_features = X.shape
+
+    # Initialize memberships randomly 
+    membership = rng.random((num_samples, n_clusters))
+    membership = membership / membership.sum(axis=1, keepdims=True)
+
+    eps = 1e-6  # Small constant to prevent division by zero
+
+    for _ in range(max_iter):
+        old_membership = membership.copy()
+
+        #compute cluster centers : v_k = sum_i (u_ik^m x_i) / sum_i (u_ik^m)
+        centers = (membership**m).T @ X / np.sum(membership**m, axis=0)[:, np.newaxis]
+
+        #distaces : d_ik = ||x_i - v_k||
+        distances = np.linalg.norm(X[:, np.newaxis] - centers, axis=2)
+        distances = np.maximum(distances, eps)
+
+        #update memberships : u_ik = 1 / sum_j (d_ik / d_ij)^(2/(m-1))
+        power = 2 / (m - 1)
+        ratio = (distances[:, :, np.newaxis] / distances[:, np.newaxis, :]) ** power
+        membership = 1 / np.sum(ratio, axis=2)
+
+        #check convergence
+        if np.max(np.abs(membership - old_membership)) <  tol:
+            break
+
+        labels = np.argmax(membership, axis=1)
+    return centers, membership, labels
 
 # ========================== MAIN PIPELINE ==========================
 
@@ -408,19 +451,19 @@ def extract_sc_features(preprocessed_train, preprocessed_test):
     
     return sc_train, sc_test
 
-def create_feature_vector_dataset(gabor_train, th_train, sc_train, gabor_test, th_test, sc_test, G_channel_train, G_channel_test):
+def create_feature_vector_dataset(gabor_train, th_train, sc_train, gabor_test, th_test, sc_test, G_clahe_train, G_clahe_test):
     """Create feature vectors for entire dataset."""
     feature_vectors_train = []
     feature_vectors_test = []
     
     print("Creating feature vectors for train data...")
-    for gabor_features, th_feature, sc_feature, G_channel in zip(gabor_train, th_train, sc_train, G_channel_train):
-        feature_vector = create_feature_vector(gabor_features, G_channel, th_feature, sc_feature)
+    for gabor_features, th_feature, sc_feature, G_clahe in zip(gabor_train, th_train, sc_train, G_clahe_train):
+        feature_vector = create_feature_vector(gabor_features, G_clahe, th_feature, sc_feature)
         feature_vectors_train.append(feature_vector)
     
     print("Creating feature vectors for test data...")
-    for gabor_features, th_feature, sc_feature, G_channel in zip(gabor_test, th_test, sc_test, G_channel_test):
-        feature_vector = create_feature_vector(gabor_features, G_channel, th_feature, sc_feature)
+    for gabor_features, th_feature, sc_feature, G_clahe in zip(gabor_test, th_test, sc_test, G_clahe_test):
+        feature_vector = create_feature_vector(gabor_features, G_clahe, th_feature, sc_feature)
         feature_vectors_test.append(feature_vector)
     
     return feature_vectors_train, feature_vectors_test
@@ -456,9 +499,51 @@ def apply_pca(feature_vectors_train, feature_vectors_test):
     X_test_pca = list(np.split(X_test_pca_all, test_split_idx, axis=0)) 
     
     return X_train_pca, X_test_pca
+
+def apply_fcm_clustering(X_train_pca, X_test_pca, train_masks, test_masks, n_clusters=2, m=2, max_iter=2000, tol=1e-6, seed=42):
+    """Apply Fuzzy C-Means clustering to PCA-reduced feature vectors."""
+
+    print("Applying Fuzzy C-Means clustering...")
+
+    binary_labels_train = []
+    for idx, X in enumerate(X_train_pca):
+        centers, membership, labels = fcm_clustering(X, n_clusters, m, max_iter, tol, seed)
+        binary_labels = (labels == 1).astype(np.uint8) 
+        
+        #number of pixels in each cluster
+        cluster_counts = np.bincount(labels)
+        vessel_cluster = np.argmin(cluster_counts)        #cluster with less pixel is vessel cluster
+        
+        #assign vessel cluster to 1 and non-vessel cluster to 0
+        binary_labels = (labels == vessel_cluster).astype(np.uint8)
+        binary_labels_train.append(binary_labels)
+
+        #reshape back to original image shape
+        binary_image = binary_labels.reshape(train_masks[idx].shape)  # Reshape to original image shape
+        save_fig10(binary_image, f"results/fig10/train_fig10_{idx+21}.png")
+
+    binary_labels_test = []
+    for idx, X in enumerate(X_test_pca):
+        centers, membership, labels = fcm_clustering(X, n_clusters, m, max_iter, tol, seed)
+        binary_labels = (labels == 1).astype(np.uint8)  
+
+        #number of pixels in each cluster
+        cluster_counts = np.bincount(labels)
+        vessel_cluster = np.argmin(cluster_counts)        #cluster with less pixel is vessel cluster
+
+        #assign vessel cluster to 1 and non-vessel cluster to 0
+        binary_labels = (labels == vessel_cluster).astype(np.uint8)
+        binary_labels_test.append(binary_labels)
+
+        #reshape back to original image shape
+        binary_image = binary_labels.reshape(test_masks[idx].shape)  # Reshape to original image shape
+        save_fig10(binary_image, f"results/fig10/test_fig10_{idx+1:02d}.png")
+
+    return binary_labels_train, binary_labels_test
+
 # ========================= SAVING FIGURES ==========================
 
-def save_fig3(G_channel, Y_channel, L_channel, save_path):
+def save_fig3(G_channel, Y_channel, L_channel, save_path): 
     """Save figure with G, Y, L channels in grayscale."""
     plt.figure(figsize=(12, 4))
     
@@ -576,38 +661,83 @@ def save_fig8(SC_feature, save_path):
     plt.savefig(save_path)
     plt.close()
 
+def save_fig10(clustered_image, save_path):
+    """Save figure of clustered image."""
+    plt.figure(figsize=(6, 6))
+    plt.imshow(clustered_image, cmap='gray')
+    plt.title('Clustered Image')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # ========================== MAIN START ==========================
 
-def main():
+"""
+Load train and test images, masks, and ground truths from DRIVE dataset.
+Return lists of images, masks, and ground truths for both train and test sets.
+"""
+data_path = "DRIVE"  # Update this path as needed
+train_images, train_masks, train_gt, test_images, test_masks, test_gt = load_drive_dataset(data_path)
 
-    #load dataset
-    data_path = "DRIVE"  # Update this path as needed
-    train_images, train_masks, train_gt, test_images, test_masks, test_gt = load_drive_dataset(data_path)
-    
-    #apply preprocessing 
-    preprocessed_train, preprocessed_test = preprocess_dataset(train_images, train_masks, test_images, test_masks)
+"""
+Apply preprocessing pipeline to each image in the dataset. 
+Shape of each item in the tuple should be:
+(0)cropped image: (H_crop, W_crop, 3)
+(1)cropped mask: (H_crop, W_crop)
+(2)G raw: (H_crop, W_crop)
+(3)Y raw: (H_crop, W_crop)
+(4)L raw: (H_crop, W_crop)
+(5)G CLAHE: (H_crop, W_crop)
+(6)Y CLAHE: (H_crop, W_crop)
+(7)L CLAHE: (H_crop, W_crop)
+(8)bounds: (y_min, y_max, x_min, x_max)
+"""
+preprocessed_train, preprocessed_test = preprocess_dataset(train_images, train_masks, test_images, test_masks)
 
-    #apply gabor filter
-    gray_gabor_train , gray_gabor_test = gabor_feature_extraction_dataset(preprocessed_train, preprocessed_test)
+"""
+Extract Gabor features for each image in the dataset.
+For each image, save list of 9 Gabor features (3 channels × 3 wavelengths) in a list.
+"""
+gray_gabor_train , gray_gabor_test = gabor_feature_extraction_dataset(preprocessed_train, preprocessed_test)
 
-    #apply automatic thresholding to gabor images
-    gabor_train, gabor_test = automatic_thresholding_gabor(gray_gabor_train, gray_gabor_test)
+""" 
+Binarize Gabor features using Laplacian enhancement + automatic thresholding.
+For each image, save list of 9 binary Gabor features in a list.
+"""
+gabor_train, gabor_test = automatic_thresholding_gabor(gray_gabor_train, gray_gabor_test)
 
-    #extract TH features
-    th_train, th_test = extract_th_features(preprocessed_train, preprocessed_test)
+""" 
+Extract TH features for each image in the dataset.
+For each image, save TH feature in a list.
+"""
+th_train, th_test = extract_th_features(preprocessed_train, preprocessed_test)
 
-    #extract SC features
-    sc_train, sc_test = extract_sc_features(preprocessed_train, preprocessed_test)
+""" 
+Extract SC features for each image in the dataset.
+For each image, save SC feature in a list.
+"""
+sc_train, sc_test = extract_sc_features(preprocessed_train, preprocessed_test)
 
-    #Create feature vectors 
-    g_clahe = [item[5] for item in preprocessed_train]
-    g_clahe_test = [item[5] for item in preprocessed_test]
-    feature_vectors_train, feature_vectors_test = create_feature_vector_dataset(gabor_train, th_train, sc_train,gabor_test, th_test, sc_test,g_clahe, g_clahe_test)
+""" 
+Create feature vectors for each image in the dataset.
+For each image, save feature vector of shape (num_pixels, num_features) in a list.
+"""
+g_clahe_train = [item[5] for item in preprocessed_train]
+g_clahe_test = [item[5] for item in preprocessed_test]
+feature_vectors_train, feature_vectors_test = create_feature_vector_dataset(gabor_train, th_train, sc_train,gabor_test, th_test, sc_test,g_clahe_train, g_clahe_test)
 
-    #PCA dimensionality reduction
-    X_train_pca, X_test_pca = apply_pca(feature_vectors_train, feature_vectors_test)
+""" 
+Apply PCA for dimensionality reduction.
+For each image, save reduced feature vector in a list.
+Shape of each feature vector should be (num_pixels, 12) after PCA.
+"""
+X_train_pca, X_test_pca = apply_pca(feature_vectors_train, feature_vectors_test)
 
-
-
-if __name__ == "__main__":
-    main()
+""" 
+Apply Fuzzy C-Means clustering to PCA-reduced feature vectors.
+For each image, save binary cluster labels (vessel=1, non-vessel=0) in a list.
+"""
+train_masks = [item[1] for item in preprocessed_train]
+test_masks = [item[1] for item in preprocessed_test]
+binary_labels_train, binary_labels_test = apply_fcm_clustering(X_train_pca, X_test_pca, train_masks, test_masks)
