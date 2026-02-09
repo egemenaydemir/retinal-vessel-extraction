@@ -285,6 +285,46 @@ def fcm_clustering(X, n_clusters, m, max_iter, tol, seed):
         labels = np.argmax(membership, axis=1)
     return centers, membership, labels
 
+# ========================= POST-PROCESSING ==========================
+def remove_fov_ring_only(classified_img, fov_img, border_px=12, outside_zero=True):
+    """
+    Remove only the border ring of the FOV from the classified image.
+    Parameters:
+    - classified_img: The input classified image (grayscale or color).
+    - fov_img: The FOV mask image (grayscale or color).
+    - border_px: The width of the border ring to remove (in pixels).
+    - outside_zero: If True, also set pixels outside the FOV to 0.
+
+    Returns:
+    - cleaned: The classified image with only the FOV border ring removed.
+    """
+
+    #gray
+    pred = cv2.cvtColor(classified_img, cv2.COLOR_BGR2GRAY) if classified_img.ndim == 3 else classified_img.copy()
+    fov  = cv2.cvtColor(fov_img, cv2.COLOR_BGR2GRAY) if fov_img.ndim == 3 else fov_img.copy()
+
+    #resize FOV to match pred 
+    if pred.shape != fov.shape:
+        fov = cv2.resize(fov, (pred.shape[1], pred.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    #binarize
+    pred_bin = ((pred > 0).astype(np.uint8)) * 255
+    fov_bin  = ((fov  > 0).astype(np.uint8)) * 255
+
+    #Create a structuring element for erosion
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*border_px+1, 2*border_px+1))
+    fov_eroded = cv2.erode(fov_bin, k)
+    ring = cv2.subtract(fov_bin, fov_eroded)  
+
+    #Only remove the ring pixels from the classified image
+    cleaned = pred_bin.copy()
+    cleaned[ring > 0] = 0
+
+    #Optionally set pixels outside the FOV to 0
+    if outside_zero:
+        cleaned[fov_bin == 0] = 0
+
+    return cleaned
 # ========================== MAIN PIPELINE ==========================
 
 def load_drive_dataset(data_path):
@@ -669,6 +709,24 @@ def apply_fast_classifier_on_nonvessel_pixels(
 
     return refined_train, refined_test, prob_maps
 
+def apply_post_processing(refined_train, refined_test, preprocessed_train, preprocessed_test):
+    """Apply post-processing to remove FOV border ring and small objects."""
+    final_train = []
+    final_test = []
+
+    print("Applying post-processing to train data...")
+    for i in range(len(refined_train)):
+        cleaned = remove_fov_ring_only(refined_train[i], preprocessed_train[i][1], border_px=12, outside_zero=True)
+        save_fig12(cleaned, f"results/fig12/train_fig12_{i+21}.png")
+        final_train.append(cleaned)
+
+    print("Applying post-processing to test data...")
+    for i in range(len(refined_test)):
+        cleaned = remove_fov_ring_only(refined_test[i], preprocessed_test[i][1], border_px=12, outside_zero=True)
+        save_fig12(cleaned, f"results/fig12/test_fig12_{i+1:02d}.png")
+        final_test.append(cleaned)
+
+    return final_train, final_test
 # ========================= SAVING FIGURES ==========================
 
 def save_fig3(G_channel, Y_channel, L_channel, save_path): 
@@ -809,6 +867,16 @@ def save_fig11(classified_image, save_path):
     plt.savefig(save_path)
     plt.close()
 
+def save_fig12(final_image, save_path):
+    """Save figure of final post-processed image."""
+    plt.figure(figsize=(6, 6))
+    plt.imshow(final_image, cmap='gray')
+    plt.title('Final Post-Processed Image')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # ========================== MAIN START ==========================
 
 """
@@ -893,3 +961,8 @@ refined_train_masks, refined_test_masks, test_prob_maps = apply_fast_classifier_
     prob_threshold=0.5,
     random_state=42
 )
+
+"""
+Apply post-processing to refine vessel segmentation results.
+"""
+final_train_masks, final_test_masks = apply_post_processing(refined_train_masks, refined_test_masks, preprocessed_train, preprocessed_test)
