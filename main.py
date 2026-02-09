@@ -1,9 +1,9 @@
 import cv2
 import numpy as np 
 from sklearn.decomposition import PCA
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import ExtraTreesClassifier
 import os
 import warnings
 import matplotlib.pyplot as plt
@@ -77,6 +77,7 @@ def preprocess_image(image, mask):
     return cropped_img, cropped_mask, G_raw, Y_raw, L_raw, G_clahe, Y_clahe, L_clahe, bounds
 
 # ========================= GABOR FILTERING ==========================
+
 def compute_gabor_sigma(wavelength, bandwidth):
     """Compute sigma for Gabor filter."""
     return (wavelength / np.pi) * np.sqrt(np.log(2) / 2) * ((2**bandwidth + 1) / (2**bandwidth - 1))
@@ -171,6 +172,7 @@ def binarize_gabor_features(gabor_features):
         binary_features.append(binary)
     
     return binary_features
+
 # ========================= TOP-HAT EXTRACTION ==========================
 
 def create_line_kernel(length, angle):
@@ -229,6 +231,7 @@ def create_feature_vector(gabor_features, G_clahe, th_feature, sc_feature):
     return feature_vector
 
 # ========================= FUZZY C-MEANS CLUSTERING ==========================
+
 def fcm_clustering(X, n_clusters, m, max_iter, tol, seed):
     """
     Fuzzy C-Means clustering.
@@ -541,6 +544,131 @@ def apply_fcm_clustering(X_train_pca, X_test_pca, train_masks, test_masks, n_clu
 
     return binary_labels_train, binary_labels_test
 
+def apply_fast_classifier_on_nonvessel_pixels(
+    X_train_pca, X_test_pca,
+    binary_labels_train, binary_labels_test,
+    preprocessed_train, preprocessed_test,
+    train_gt,
+    n_estimators=300,
+    samples_per_train_image=4000,
+    prob_threshold=0.5,
+    random_state=42
+):
+    """
+    Apply FAST classifier (ExtraTrees) to non-vessel pixels to detect missed vessels.
+    Parameters:
+    - X_train_pca, X_test_pca: PCA-reduced feature vectors for train and test images.
+    - binary_labels_train, binary_labels_test: Binary labels from FCM clustering (1 for vessel, 0 for non-vessel).
+    - preprocessed_train, preprocessed_test: Preprocessed data tuples for train and test images.
+    - train_gt: Ground truth vessel masks for training images (used for labeling non-vessel pixels).
+    - n_estimators: Number of trees in the ExtraTrees ensemble.
+    - samples_per_train_image: Maximum number of non-vessel pixels to sample from each training image for training the classifier.
+    - prob_threshold: Probability threshold for classifying a pixel as vessel in the test set.
+    - random_state: Random seed for reproducibility.
+    Returns:
+    - refined_train: List of refined binary vessel masks for training images after applying the classifier.
+    - refined_test: List of refined binary vessel masks for test images after applying the classifier.
+    - prob_maps: List of probability maps for test images indicating the likelihood of each pixel being a vessel according to the classifier.
+    """
+
+    print("Applying FAST classifier (ExtraTrees) on non-vessel pixels...")
+
+    rng = np.random.default_rng(random_state)
+
+    X_all = []
+    y_all = []
+
+    for i in range(len(X_train_pca)):
+        cropped_mask = preprocessed_train[i][1]  # FOV crop mask
+        bounds = preprocessed_train[i][8]
+        y_min, y_max, x_min, x_max = bounds
+        gt_crop = train_gt[i][y_min:y_max+1, x_min:x_max+1]
+
+        gt_flat = (gt_crop.reshape(-1) > 0).astype(np.uint8)
+        fov_flat = (cropped_mask.reshape(-1) > 0)
+
+        nonv_flat = (binary_labels_train[i].reshape(-1) == 0)
+        cand = np.where(fov_flat & nonv_flat)[0]
+        if cand.size == 0:
+            continue
+
+        take = min(samples_per_train_image, cand.size)
+        sel = rng.choice(cand, size=take, replace=False)
+
+        X_all.append(X_train_pca[i][sel].astype(np.float32))
+        y_all.append(gt_flat[sel])
+
+    X_all = np.vstack(X_all)
+    y_all = np.concatenate(y_all)
+
+    clf = ExtraTreesClassifier(
+        n_estimators=n_estimators,
+        max_depth=None,
+        min_samples_leaf=2,
+        max_features="sqrt",
+        n_jobs=-1,
+        random_state=random_state,
+        class_weight="balanced_subsample",
+    )
+    clf.fit(X_all, y_all)
+
+    if 1 in clf.classes_:
+        c1 = np.where(clf.classes_ == 1)[0][0]
+    else:
+        c1 = None
+
+    #Apply to train
+    refined_train = []
+    for i in range(len(X_train_pca)):
+        cropped_mask = preprocessed_train[i][1]
+        H, W = cropped_mask.shape
+
+        vessel_from_cluster = (binary_labels_train[i].reshape(-1) == 1)
+        refined_flat = vessel_from_cluster.copy()
+
+        if c1 is not None:
+            nonv = (binary_labels_train[i].reshape(-1) == 0)
+            fov = (cropped_mask.reshape(-1) > 0)
+            idx = np.where(nonv & fov)[0]
+
+            if idx.size > 0:
+                proba = clf.predict_proba(X_train_pca[i][idx].astype(np.float32))
+                refined_flat[idx] |= (proba[:, c1] >= prob_threshold)
+
+        image = refined_flat.reshape(H, W).astype(np.uint8)
+        save_fig11(image, f"results/fig11/train_fig11_{i+21}.png")
+
+        refined_train.append(image)
+
+
+    #Apply to test
+    refined_test = []
+    prob_maps = []
+    for i in range(len(X_test_pca)):
+        cropped_mask = preprocessed_test[i][1]
+        H, W = cropped_mask.shape
+
+        vessel_from_cluster = (binary_labels_test[i].reshape(-1) == 1)
+        refined_flat = vessel_from_cluster.copy()
+        prob_flat = np.zeros(H * W, dtype=float)
+
+        if c1 is not None:
+            nonv = (binary_labels_test[i].reshape(-1) == 0)
+            fov = (cropped_mask.reshape(-1) > 0)
+            idx = np.where(nonv & fov)[0]
+
+            if idx.size > 0:
+                proba = clf.predict_proba(X_test_pca[i][idx].astype(np.float32))
+                prob_flat[idx] = proba[:, c1]
+                refined_flat[idx] |= (proba[:, c1] >= prob_threshold)
+
+        image = refined_flat.reshape(H, W).astype(np.uint8)
+        save_fig11(image, f"results/fig11/test_fig11_{i+1:02d}.png")
+        refined_test.append(image)
+        prob_maps.append(prob_flat.reshape(H, W))
+
+    return refined_train, refined_test, prob_maps
+
 # ========================= SAVING FIGURES ==========================
 
 def save_fig3(G_channel, Y_channel, L_channel, save_path): 
@@ -671,6 +799,16 @@ def save_fig10(clustered_image, save_path):
     plt.savefig(save_path)
     plt.close()
 
+def save_fig11(classified_image, save_path):
+    """Save figure of classified image."""
+    plt.figure(figsize=(6, 6))
+    plt.imshow(classified_image, cmap='gray')
+    plt.title('Classified Image')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # ========================== MAIN START ==========================
 
 """
@@ -741,3 +879,17 @@ For each image, save binary cluster labels (vessel=1, non-vessel=0) in a list.
 train_masks = [item[1] for item in preprocessed_train]
 test_masks = [item[1] for item in preprocessed_test]
 binary_labels_train, binary_labels_test = apply_fcm_clustering(X_train_pca, X_test_pca, train_masks, test_masks)
+
+"""
+Apply Decision Tree classifier to Non-vessel pixels to detect missed vessels.
+"""
+refined_train_masks, refined_test_masks, test_prob_maps = apply_fast_classifier_on_nonvessel_pixels(
+    X_train_pca, X_test_pca,
+    binary_labels_train, binary_labels_test,
+    preprocessed_train, preprocessed_test,
+    train_gt,
+    n_estimators=300,
+    samples_per_train_image=4000,
+    prob_threshold=0.5,
+    random_state=42
+)
