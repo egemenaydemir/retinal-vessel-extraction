@@ -74,14 +74,39 @@ def apply_clahe(channel, clip_limit=2.0, tile_size=(8, 8)):
 
 def preprocess_image(image, mask):
     """Complete preprocessing pipeline."""
-    cropped_img, bounds = crop_to_fov(image, mask)
+    #Step1 - Crop to FOV
+    cropped_image, bounds = crop_to_fov(image, mask)
     cropped_mask = crop_mask(mask, bounds)
-    G_raw, Y_raw, L_raw = extract_channels(cropped_img)
-    G_clahe = apply_clahe(G_raw)
-    Y_clahe = apply_clahe(Y_raw)
-    L_clahe = apply_clahe(L_raw)
-    return cropped_img, cropped_mask, G_raw, Y_raw, L_raw, G_clahe, Y_clahe, L_clahe, bounds
 
+    #Step2 - Extract channels
+    G, Y, L = extract_channels(cropped_image)
+
+    #Step3 - fill with median value outside FOV to avoid artifacts during CLAHE
+    G = fill_outside_fov(G, cropped_mask, fill_value=int(np.median(G[cropped_mask > 0])))
+    Y = fill_outside_fov(Y, cropped_mask, fill_value=int(np.median(Y[cropped_mask > 0])))
+    L = fill_outside_fov(L, cropped_mask, fill_value=int(np.median(L[cropped_mask > 0])))
+
+    #Step4 - Apply CLAHE
+    G_clahe = apply_clahe(G)
+    Y_clahe = apply_clahe(Y)
+    L_clahe = apply_clahe(L)
+
+    #Step5 - Fill outside FOV with 0
+    G_clahe = fill_outside_fov(G_clahe, cropped_mask, fill_value=0)
+    Y_clahe = fill_outside_fov(Y_clahe, cropped_mask, fill_value=0)
+    L_clahe = fill_outside_fov(L_clahe, cropped_mask, fill_value=0)
+    
+    return {
+        'G_raw': G,
+        'Y_raw': Y,
+        'L_raw': L,
+        'G_clahe': G_clahe,
+        'Y_clahe': Y_clahe,
+        'L_clahe': L_clahe,
+        'cropped_mask': cropped_mask,
+        'cropped_image': cropped_image,
+        'bounds': bounds
+    }
 # ========================= GABOR FILTERING ==========================
 
 def compute_gabor_sigma(wavelength, bandwidth):
@@ -894,16 +919,7 @@ train_images, train_masks, train_gt, test_images, test_masks, test_gt = load_dri
 
 """
 Apply preprocessing pipeline to each image in the dataset. 
-Shape of each item in the tuple should be:
-(0)cropped image: (H_crop, W_crop, 3)
-(1)cropped mask: (H_crop, W_crop)
-(2)G raw: (H_crop, W_crop)
-(3)Y raw: (H_crop, W_crop)
-(4)L raw: (H_crop, W_crop)
-(5)G CLAHE: (H_crop, W_crop)
-(6)Y CLAHE: (H_crop, W_crop)
-(7)L CLAHE: (H_crop, W_crop)
-(8)bounds: (y_min, y_max, x_min, x_max)
+Returns a dictionary for each image containing cropped image, cropped mask, G/Y/L channels before and after CLAHE, and crop bounds.
 """
 preprocessed_train, preprocessed_test = preprocess_dataset(train_images, train_masks, test_images, test_masks)
 
