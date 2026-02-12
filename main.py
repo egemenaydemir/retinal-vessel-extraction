@@ -1,9 +1,11 @@
+import csv
 import cv2
 import numpy as np 
 from sklearn.decomposition import PCA
 from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import ExtraTreesClassifier
+import skfuzzy as fuzz
 import os
 import warnings
 import matplotlib.pyplot as plt
@@ -181,17 +183,17 @@ def calculate_automatic_threshold(image):
     
     return threshold
 
-def binarize_gabor_features(gabor_features):
+def binarize_gabor_features(gabor_feature, mask, method):
     """
     Binarize Gabor features.
     
     Laplacian enhancement + automatic threshold (paper method)
     """
-    binary_features = []
+    gabor_norm = cv2.normalize(gabor_feature, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     
-    for gabor in gabor_features:
-
-        gabor_norm = cv2.normalize(gabor, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    if method == 'otsu':
+        _, binary = cv2.threshold(gabor_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
         laplacian = cv2.Laplacian(gabor_norm, cv2.CV_64F)
         laplacian = laplacian.astype(np.uint8)
         combined = (laplacian + gabor_norm).astype(np.uint8)
@@ -200,9 +202,8 @@ def binarize_gabor_features(gabor_features):
         threshold = calculate_automatic_threshold(combined)
         _, binary = cv2.threshold(combined, int(threshold), 255, cv2.THRESH_BINARY)
         
-        binary_features.append(binary)
-    
-    return binary_features
+    binary = fill_outside_fov(binary, mask, fill_value=0)
+    return binary
 
 # ========================= TOP-HAT EXTRACTION ==========================
 
@@ -263,60 +264,45 @@ def create_feature_vector(gabor_features, G_clahe, th_feature, sc_feature):
 
 # ========================= FUZZY C-MEANS CLUSTERING ==========================
 
-def fcm_clustering(X, n_clusters, m, max_iter, tol, seed):
+def fcm_fit_predict(X, n_clusters=2, m=2.0, error=1e-6, maxiter=2000, seed=40):
     """
-    Fuzzy C-Means clustering.
-
-    Parameters:
-    - X: Input data (num_samples, num_features)
-    - n_clusters: Number of clusters
-    - m: Fuzziness parameter
-    - max_iter: Maximum number of iterations
-    - tol: Tolerance for convergence
-    - seed: Random seed for reproducibility
-
-    Returns:
-    - centers: Cluster centers (n_clusters, num_features)
-    - membership: Membership matrix (num_samples, n_clusters)
-
+    X: (n_samples, n_features)
+    return:
+      labels: (n_samples,)
+      U: (n_clusters, n_samples) membership
+      centers: (n_clusters, n_features)
     """
-
-    if m <= 1:
-        raise ValueError("Fuzziness parameter m must be greater than 1.")
-    
-
     rng = np.random.default_rng(seed)
-    num_samples, num_features = X.shape
+    # Expected format: (n_features, n_samples)
+    data = X.T.astype(np.float64)
 
-    # Initialize memberships randomly 
-    membership = rng.random((num_samples, n_clusters))
-    membership = membership / membership.sum(axis=1, keepdims=True)
+    cntr, U, U0, d, jm, p, fpc = fuzz.cluster.cmeans(
+        data=data,
+        c=n_clusters,
+        m=m,
+        error=error,
+        maxiter=maxiter,
+        init=None,          # if desired, U0 can be provided
+        seed=seed
+    )
 
-    eps = 1e-6  # Small constant to prevent division by zero
+    labels = np.argmax(U, axis=0)
+    return labels, U, cntr, fpc
 
-    for _ in range(max_iter):
-        old_membership = membership.copy()
+def find_cluster_with_less_pixels(labels):
+    """Find the cluster index that has less pixels (assumed to be vessel cluster)."""
+    unique, counts = np.unique(labels, return_counts=True)
+    cluster_counts = dict(zip(unique, counts))
+    vessel_cluster = min(cluster_counts, key=cluster_counts.get)
+    return vessel_cluster
 
-        #compute cluster centers : v_k = sum_i (u_ik^m x_i) / sum_i (u_ik^m)
-        centers = (membership**m).T @ X / np.sum(membership**m, axis=0)[:, np.newaxis]
-
-        #distaces : d_ik = ||x_i - v_k||
-        distances = np.linalg.norm(X[:, np.newaxis] - centers, axis=2)
-        distances = np.maximum(distances, eps)
-
-        #update memberships : u_ik = 1 / sum_j (d_ik / d_ij)^(2/(m-1))
-        power = 2 / (m - 1)
-        ratio = (distances[:, :, np.newaxis] / distances[:, np.newaxis, :]) ** power
-        membership = 1 / np.sum(ratio, axis=2)
-
-        #check convergence
-        if np.max(np.abs(membership - old_membership)) <  tol:
-            break
-
-        labels = np.argmax(membership, axis=1)
-    return centers, membership, labels
+def binary_fcm_prediction(labels, vessel_cluster):
+    """Convert FCM labels to binary prediction (vessel vs non-vessel)."""
+    binary_prediction = (labels == vessel_cluster).astype(np.uint8) * 255
+    return binary_prediction
 
 # ========================= POST-PROCESSING ==========================
+
 def remove_fov_ring_only(classified_img, fov_img, border_px=12, outside_zero=True):
     """
     Remove only the border ring of the FOV from the classified image.
@@ -356,6 +342,7 @@ def remove_fov_ring_only(classified_img, fov_img, border_px=12, outside_zero=Tru
         cleaned[fov_bin == 0] = 0
 
     return cleaned
+
 # ========================== MAIN PIPELINE ==========================
 
 def load_drive_dataset(data_path):
@@ -393,64 +380,137 @@ def preprocess_dataset(training_images, training_masks, test_images, test_masks)
     """
     Preprocess entire dataset.
     Save figures 3 and 4 for each image.
-    
     """
-    preprocessed_train = []
-    preprocessed_test = []
+    preprocessed_train = {
+        'G_raw': [],
+        'Y_raw': [],
+        'L_raw': [],
+        'G_clahe': [],
+        'Y_clahe': [],
+        'L_clahe': [],
+        'cropped_mask': [],
+        'cropped_image': [],
+        'bounds': []
+    }
+    preprocessed_test = {
+        'G_raw': [],
+        'Y_raw': [],
+        'L_raw': [],
+        'G_clahe': [],
+        'Y_clahe': [],
+        'L_clahe': [],
+        'cropped_mask': [],
+        'cropped_image': [],
+        'bounds': []
+    }
     
     print("Preprocessing train data...")
     for idx, (img, mask) in enumerate(zip(training_images, training_masks)):
-        (cropped_img, cropped_mask, G_raw, Y_raw, L_raw,
-         G_clahe, Y_clahe, L_clahe, bounds) = preprocess_image(img, mask)
-        
+        result = preprocess_image(img, mask)
         # Save figures
-        save_fig3(G_raw, Y_raw, L_raw, f"results/fig3/train_fig3_{idx+21}.png")
-        save_fig4(G_clahe, Y_clahe, L_clahe, f"results/fig4/train_fig4_{idx+21}.png")
+        save_fig3(result['G_raw'], result['Y_raw'], result['L_raw'], f"results/fig3/train_fig3_{idx+21}.png")
+        save_fig4(result['G_clahe'], result['Y_clahe'], result['L_clahe'], f"results/fig4/train_fig4_{idx+21}.png")
         
-        preprocessed_train.append((cropped_img, cropped_mask, G_raw, Y_raw, L_raw,
-                                   G_clahe, Y_clahe, L_clahe, bounds))
+        preprocessed_train['G_raw'].append(result['G_raw'])
+        preprocessed_train['Y_raw'].append(result['Y_raw'])
+        preprocessed_train['L_raw'].append(result['L_raw'])
+        preprocessed_train['G_clahe'].append(result['G_clahe'])
+        preprocessed_train['Y_clahe'].append(result['Y_clahe'])
+        preprocessed_train['L_clahe'].append(result['L_clahe'])
+        preprocessed_train['cropped_mask'].append(result['cropped_mask'])
+        preprocessed_train['cropped_image'].append(result['cropped_image'])
+        preprocessed_train['bounds'].append(result['bounds'])
+        
     
     print("Preprocessing test data...")
     for idx, (img, mask) in enumerate(zip(test_images, test_masks)):
-        (cropped_img, cropped_mask, G_raw, Y_raw, L_raw,
-         G_clahe, Y_clahe, L_clahe, bounds) = preprocess_image(img, mask)
+        result = preprocess_image(img, mask)
         
         # Save figures
-        save_fig3(G_raw, Y_raw, L_raw, f"results/fig3/test_fig3_{idx+1:02d}.png")
-        save_fig4(G_clahe, Y_clahe, L_clahe, f"results/fig4/test_fig4_{idx+1:02d}.png")
-        
-        preprocessed_test.append((cropped_img, cropped_mask, G_raw, Y_raw, L_raw,
-                                  G_clahe, Y_clahe, L_clahe, bounds))
+        save_fig3(result['G_raw'], result['Y_raw'], result['L_raw'], f"results/fig3/test_fig3_{idx+1:02d}.png")
+        save_fig4(result['G_clahe'], result['Y_clahe'], result['L_clahe'], f"results/fig4/test_fig4_{idx+1:02d}.png")
+            
+        preprocessed_test['G_raw'].append(result['G_raw'])
+        preprocessed_test['Y_raw'].append(result['Y_raw'])
+        preprocessed_test['L_raw'].append(result['L_raw'])
+        preprocessed_test['G_clahe'].append(result['G_clahe'])
+        preprocessed_test['Y_clahe'].append(result['Y_clahe'])
+        preprocessed_test['L_clahe'].append(result['L_clahe'])
+        preprocessed_test['cropped_mask'].append(result['cropped_mask'])
+        preprocessed_test['cropped_image'].append(result['cropped_image'])
+        preprocessed_test['bounds'].append(result['bounds'])
     
     return preprocessed_train, preprocessed_test
     
 def gabor_feature_extraction_dataset(preprocessed_train, preprocessed_test):
     """
     Extract Gabor features for entire dataset.
+    Save figure 5 for each image.
     """
-    gabor_train = []
-    gabor_test = []
+    gabor_train = {
+        'Gabor_G9': [],
+        'Gabor_G10': [],
+        'Gabor_G11': [],
+        'Gabor_Y9': [],
+        'Gabor_Y10': [],
+        'Gabor_Y11': [],
+        'Gabor_L9': [],
+        'Gabor_L10': [],
+        'Gabor_L11': []
+    }
+    gabor_test = {
+        'Gabor_G9': [],
+        'Gabor_G10': [],
+        'Gabor_G11': [],
+        'Gabor_Y9': [],
+        'Gabor_Y10': [],
+        'Gabor_Y11': [],
+        'Gabor_L9': [],
+        'Gabor_L10': [],
+        'Gabor_L11': []
+    }
     
     print("Extracting Gabor features for train data...")
-    for idx, (_, _, _, _, _, G_clahe, Y_clahe, L_clahe, _) in enumerate(preprocessed_train):
-        
+    for i in range(len(preprocessed_train['G_clahe'])):
+        G_clahe = preprocessed_train['G_clahe'][i]
+        Y_clahe = preprocessed_train['Y_clahe'][i]
+        L_clahe = preprocessed_train['L_clahe'][i]
+
         gabor_features = extract_gabor_features(G_clahe, Y_clahe, L_clahe)
-        gabor_train.append(gabor_features)
+        gabor_train['Gabor_G9'].append(gabor_features[0])
+        gabor_train['Gabor_G10'].append(gabor_features[1])
+        gabor_train['Gabor_G11'].append(gabor_features[2])
+        gabor_train['Gabor_Y9'].append(gabor_features[3])
+        gabor_train['Gabor_Y10'].append(gabor_features[4])
+        gabor_train['Gabor_Y11'].append(gabor_features[5])
+        gabor_train['Gabor_L9'].append(gabor_features[6])
+        gabor_train['Gabor_L10'].append(gabor_features[7])
+        gabor_train['Gabor_L11'].append(gabor_features[8])
 
         # Save figure 5 
         save_fig5(gabor_features[0:3], gabor_features[3:6], gabor_features[6:9],
-                   f"results/fig5/train_fig5_{idx+21}.png")
+                   f"results/fig5/train_fig5_{i+21}.png")
 
-    
     print("Extracting Gabor features for test data...")
-    for idx, (_, _, _, _, _, G_clahe, Y_clahe, L_clahe, _) in enumerate(preprocessed_test):
-        
+    for i in range(len(preprocessed_test['G_clahe'])):
+        G_clahe = preprocessed_test['G_clahe'][i]
+        Y_clahe = preprocessed_test['Y_clahe'][i]
+        L_clahe = preprocessed_test['L_clahe'][i]
+
         gabor_features = extract_gabor_features(G_clahe, Y_clahe, L_clahe)
-        gabor_test.append(gabor_features)
+        gabor_test['Gabor_G9'].append(gabor_features[0])
+        gabor_test['Gabor_G10'].append(gabor_features[1])
+        gabor_test['Gabor_G11'].append(gabor_features[2])
+        gabor_test['Gabor_Y9'].append(gabor_features[3])
+        gabor_test['Gabor_Y10'].append(gabor_features[4])
+        gabor_test['Gabor_Y11'].append(gabor_features[5])
+        gabor_test['Gabor_L9'].append(gabor_features[6])
+        gabor_test['Gabor_L10'].append(gabor_features[7])
+        gabor_test['Gabor_L11'].append(gabor_features[8])
 
         # Save figure 5 
         save_fig5(gabor_features[0:3], gabor_features[3:6], gabor_features[6:9],
-                   f"results/fig5/test_fig5_{idx+1:02d}.png")
+                   f"results/fig5/test_fig5_{i+1:02d}.png")
     
     return gabor_train, gabor_test
 
@@ -459,27 +519,68 @@ def automatic_thresholding_gabor(gabor_train, gabor_test):
     Apply automatic thresholding to Gabor features for entire dataset.
     """
     
-    binary_train = []
-    binary_test = []
+    binary_train = {
+        'Gabor_G9': [],
+        'Gabor_G10': [],
+        'Gabor_G11': [],
+        'Gabor_Y9': [],
+        'Gabor_Y10': [],
+        'Gabor_Y11': [],
+        'Gabor_L9': [],
+        'Gabor_L10': [],
+        'Gabor_L11': []
+    }
+    binary_test = {
+        'Gabor_G9': [],
+        'Gabor_G10': [],
+        'Gabor_G11': [],
+        'Gabor_Y9': [],
+        'Gabor_Y10': [],
+        'Gabor_Y11': [],
+        'Gabor_L9': [],
+        'Gabor_L10': [],
+        'Gabor_L11': []
+        }
 
     print("Applying automatic thresholding to train Gabor features...")
-    for idx, gabor_features in enumerate(gabor_train):
-        binary_features = binarize_gabor_features(gabor_features)
-        binary_train.append(binary_features)
+    for i in range(len(gabor_train['Gabor_G9'])):
+        binary_train['Gabor_G9'].append(binarize_gabor_features(gabor_train['Gabor_G9'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_G10'].append(binarize_gabor_features(gabor_train['Gabor_G10'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_G11'].append(binarize_gabor_features(gabor_train['Gabor_G11'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_Y9'].append(binarize_gabor_features(gabor_train['Gabor_Y9'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_Y10'].append(binarize_gabor_features(gabor_train['Gabor_Y10'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_Y11'].append(binarize_gabor_features(gabor_train['Gabor_Y11'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_L9'].append(binarize_gabor_features(gabor_train['Gabor_L9'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_L10'].append(binarize_gabor_features(gabor_train['Gabor_L10'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
+        binary_train['Gabor_L11'].append(binarize_gabor_features(gabor_train['Gabor_L11'][i], preprocessed_train['cropped_mask'][i], method='otsu'))
 
-        # Save figure 6
-        save_fig6(binary_features[0:3], binary_features[3:6], binary_features[6:9],
-                   f"results/fig6/train_fig6_{idx+21}.png")
+
+        # # Save figure 6
+        Binary_G = [binary_train['Gabor_G9'][i], binary_train['Gabor_G10'][i], binary_train['Gabor_G11'][i]]
+        Binary_Y = [binary_train['Gabor_Y9'][i], binary_train['Gabor_Y10'][i], binary_train['Gabor_Y11'][i]]
+        Binary_L = [binary_train['Gabor_L9'][i], binary_train['Gabor_L10'][i], binary_train['Gabor_L11'][i]]
+        save_fig6(Binary_G, Binary_Y, Binary_L,
+                   f"results/fig6/train_fig6_{i+21}.png")
 
 
     print("Applying automatic thresholding to test Gabor features...")
-    for idx, gabor_features in enumerate(gabor_test):
-        binary_features = binarize_gabor_features(gabor_features)
-        binary_test.append(binary_features)
-
-        # Save figure 6
-        save_fig6(binary_features[0:3], binary_features[3:6], binary_features[6:9],
-                   f"results/fig6/test_fig6_{idx+1:02d}.png")
+    for i in range(len(gabor_test['Gabor_G9'])):
+        binary_test['Gabor_G9'].append(binarize_gabor_features(gabor_test['Gabor_G9'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_G10'].append(binarize_gabor_features(gabor_test['Gabor_G10'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_G11'].append(binarize_gabor_features(gabor_test['Gabor_G11'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_Y9'].append(binarize_gabor_features(gabor_test['Gabor_Y9'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_Y10'].append(binarize_gabor_features(gabor_test['Gabor_Y10'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_Y11'].append(binarize_gabor_features(gabor_test['Gabor_Y11'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_L9'].append(binarize_gabor_features(gabor_test['Gabor_L9'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_L10'].append(binarize_gabor_features(gabor_test['Gabor_L10'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+        binary_test['Gabor_L11'].append(binarize_gabor_features(gabor_test['Gabor_L11'][i], preprocessed_test['cropped_mask'][i], method='otsu'))
+    
+        # # Save figure 6
+        Binary_G = [binary_test['Gabor_G9'][i], binary_test['Gabor_G10'][i], binary_test['Gabor_G11'][i]]
+        Binary_Y = [binary_test['Gabor_Y9'][i], binary_test['Gabor_Y10'][i], binary_test['Gabor_Y11'][i]]
+        Binary_L = [binary_test['Gabor_L9'][i], binary_test['Gabor_L10'][i], binary_test['Gabor_L11'][i]]
+        save_fig6(Binary_G, Binary_Y, Binary_L,
+                   f"results/fig6/test_fig6_{i+1:02d}.png")
 
     return binary_train, binary_test
 
@@ -488,19 +589,23 @@ def extract_th_features(preprocessed_train, preprocessed_test):
 
     print("Extracting TH features for train data...")
     th_train = []
-    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_train):
+    for i in range(len(preprocessed_train['G_clahe'])):
+        G_clahe = preprocessed_train['G_clahe'][i]
         TH_feature = top_hat_extraction(G_clahe)
         th_train.append(TH_feature)
 
-        save_fig7(TH_feature, f"results/fig7/train_fig7_{idx+21}.png")
+        # Save figure 7
+        save_fig7(TH_feature, f"results/fig7/train_fig7_{i+21}.png")
 
     print("Extracting TH features for test data...")
     th_test = []
-    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_test):
+    for i in range(len(preprocessed_test['G_clahe'])):
+        G_clahe = preprocessed_test['G_clahe'][i]
         TH_feature = top_hat_extraction(G_clahe)
         th_test.append(TH_feature)
 
-        save_fig7(TH_feature, f"results/fig7/test_fig7_{idx+1:02d}.png")
+        # Save figure 7
+        save_fig7(TH_feature, f"results/fig7/test_fig7_{i+1:02d}.png")
     
     return th_train, th_test
 
@@ -509,19 +614,21 @@ def extract_sc_features(preprocessed_train, preprocessed_test):
 
     print("Extracting SC features for train data...")
     sc_train = []
-    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_train):
+    for i in range(len(preprocessed_train['G_clahe'])):
+        G_clahe = preprocessed_train['G_clahe'][i]
         SC_feature = SC_extraction(G_clahe)
         sc_train.append(SC_feature)
 
-        save_fig8(SC_feature, f"results/fig8/train_fig8_{idx+21}.png")
+        save_fig8(SC_feature, f"results/fig8/train_fig8_{i+21}.png")
 
     print("Extracting SC features for test data...")
     sc_test = []
-    for idx, (_, _, _, _, _, G_clahe, _, _, _) in enumerate(preprocessed_test):
+    for i in range(len(preprocessed_test['G_clahe'])):
+        G_clahe = preprocessed_test['G_clahe'][i]
         SC_feature = SC_extraction(G_clahe)
         sc_test.append(SC_feature)
 
-        save_fig8(SC_feature, f"results/fig8/test_fig8_{idx+1:02d}.png")
+        save_fig8(SC_feature, f"results/fig8/test_fig8_{i+1:02d}.png")
     
     return sc_train, sc_test
 
@@ -531,12 +638,40 @@ def create_feature_vector_dataset(gabor_train, th_train, sc_train, gabor_test, t
     feature_vectors_test = []
     
     print("Creating feature vectors for train data...")
-    for gabor_features, th_feature, sc_feature, G_clahe in zip(gabor_train, th_train, sc_train, G_clahe_train):
+    for i in range(len(gabor_train['Gabor_G9'])):
+        gabor_features = [
+            gabor_train['Gabor_G9'][i],
+            gabor_train['Gabor_G10'][i],
+            gabor_train['Gabor_G11'][i],
+            gabor_train['Gabor_Y9'][i],
+            gabor_train['Gabor_Y10'][i],
+            gabor_train['Gabor_Y11'][i],
+            gabor_train['Gabor_L9'][i],
+            gabor_train['Gabor_L10'][i],
+            gabor_train['Gabor_L11'][i]
+        ]
+        th_feature = th_train[i]
+        sc_feature = sc_train[i]
+        G_clahe = G_clahe_train[i]
         feature_vector = create_feature_vector(gabor_features, G_clahe, th_feature, sc_feature)
         feature_vectors_train.append(feature_vector)
     
     print("Creating feature vectors for test data...")
-    for gabor_features, th_feature, sc_feature, G_clahe in zip(gabor_test, th_test, sc_test, G_clahe_test):
+    for i in range(len(gabor_test['Gabor_G9'])):
+        gabor_features = [
+            gabor_test['Gabor_G9'][i],
+            gabor_test['Gabor_G10'][i],
+            gabor_test['Gabor_G11'][i],
+            gabor_test['Gabor_Y9'][i],
+            gabor_test['Gabor_Y10'][i],
+            gabor_test['Gabor_Y11'][i],
+            gabor_test['Gabor_L9'][i],
+            gabor_test['Gabor_L10'][i],
+            gabor_test['Gabor_L11'][i]
+        ]
+        th_feature = th_test[i]
+        sc_feature = sc_test[i]
+        G_clahe = G_clahe_test[i]
         feature_vector = create_feature_vector(gabor_features, G_clahe, th_feature, sc_feature)
         feature_vectors_test.append(feature_vector)
     
@@ -553,15 +688,15 @@ def apply_pca(feature_vectors_train, feature_vectors_test):
     X_train = np.vstack(feature_vectors_train)
     X_test = np.vstack(feature_vectors_test)
 
-    # Scale using training statistics, then transform test with same scaler
     scaler = StandardScaler()
     scaler.fit(X_train)
+
     X_train_scaled = scaler.transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Apply PCA (keep 95% variance)
     pca = PCA(n_components=12)
     pca.fit(X_train_scaled)
+
     X_train_pca_all = pca.transform(X_train_scaled)
     X_test_pca_all = pca.transform(X_test_scaled)
 
@@ -574,46 +709,35 @@ def apply_pca(feature_vectors_train, feature_vectors_test):
     
     return X_train_pca, X_test_pca
 
-def apply_fcm_clustering(X_train_pca, X_test_pca, train_masks, test_masks, n_clusters=2, m=2, max_iter=2000, tol=1e-6, seed=42):
-    """Apply Fuzzy C-Means clustering to PCA-reduced feature vectors."""
+def apply_fcm(X_train_pca, X_test_pca, n_clusters=2, m=2.0, error=1e-6, maxiter=2000, seed=40):
+    """
+    Apply FCM clustering to PCA-reduced features.
+    Returns list of binary predictions for train and test sets.
+    """
+    clustered_train = []
+    clustered_test = []
 
-    print("Applying Fuzzy C-Means clustering...")
+    print("Applying FCM to train data...")
+    for i in range(len(X_train_pca)):
+        labels, U, centers, fpc = fcm_fit_predict(X_train_pca[i], n_clusters, m, error, maxiter, seed)
+        vessel_cluster = find_cluster_with_less_pixels(labels)
+        binary_prediction = binary_fcm_prediction(labels, vessel_cluster)
+        clustered_train.append(binary_prediction)
 
-    binary_labels_train = []
-    for idx, X in enumerate(X_train_pca):
-        centers, membership, labels = fcm_clustering(X, n_clusters, m, max_iter, tol, seed)
-        binary_labels = (labels == 1).astype(np.uint8) 
-        
-        #number of pixels in each cluster
-        cluster_counts = np.bincount(labels)
-        vessel_cluster = np.argmin(cluster_counts)        #cluster with less pixel is vessel cluster
-        
-        #assign vessel cluster to 1 and non-vessel cluster to 0
-        binary_labels = (labels == vessel_cluster).astype(np.uint8)
-        binary_labels_train.append(binary_labels)
+        #save figure 10
+        save_fig10(binary_prediction.reshape(preprocessed_train['cropped_mask'][i].shape), f"results/fig10/train_fig10_{i+21}.png")
+    
+    print("Applying FCM to test data...")
+    for i in range(len(X_test_pca)):
+        labels, U, centers, fpc = fcm_fit_predict(X_test_pca[i], n_clusters, m, error, maxiter, seed)
+        vessel_cluster = find_cluster_with_less_pixels(labels)
+        binary_prediction = binary_fcm_prediction(labels, vessel_cluster)
+        clustered_test.append(binary_prediction)
 
-        #reshape back to original image shape
-        binary_image = binary_labels.reshape(train_masks[idx].shape)  # Reshape to original image shape
-        save_fig10(binary_image, f"results/fig10/train_fig10_{idx+21}.png")
+        #save figure 10
+        save_fig10(binary_prediction.reshape(preprocessed_test['cropped_mask'][i].shape), f"results/fig10/test_fig10_{i+1:02d}.png")
 
-    binary_labels_test = []
-    for idx, X in enumerate(X_test_pca):
-        centers, membership, labels = fcm_clustering(X, n_clusters, m, max_iter, tol, seed)
-        binary_labels = (labels == 1).astype(np.uint8)  
-
-        #number of pixels in each cluster
-        cluster_counts = np.bincount(labels)
-        vessel_cluster = np.argmin(cluster_counts)        #cluster with less pixel is vessel cluster
-
-        #assign vessel cluster to 1 and non-vessel cluster to 0
-        binary_labels = (labels == vessel_cluster).astype(np.uint8)
-        binary_labels_test.append(binary_labels)
-
-        #reshape back to original image shape
-        binary_image = binary_labels.reshape(test_masks[idx].shape)  # Reshape to original image shape
-        save_fig10(binary_image, f"results/fig10/test_fig10_{idx+1:02d}.png")
-
-    return binary_labels_train, binary_labels_test
+    return clustered_train, clustered_test
 
 def apply_fast_classifier_on_nonvessel_pixels(
     X_train_pca, X_test_pca,
@@ -650,8 +774,8 @@ def apply_fast_classifier_on_nonvessel_pixels(
     y_all = []
 
     for i in range(len(X_train_pca)):
-        cropped_mask = preprocessed_train[i][1]  # FOV crop mask
-        bounds = preprocessed_train[i][8]
+        cropped_mask = preprocessed_train['cropped_mask'][i]  # FOV crop mask
+        bounds = preprocessed_train['bounds'][i]
         y_min, y_max, x_min, x_max = bounds
         gt_crop = train_gt[i][y_min:y_max+1, x_min:x_max+1]
 
@@ -691,7 +815,7 @@ def apply_fast_classifier_on_nonvessel_pixels(
     #Apply to train
     refined_train = []
     for i in range(len(X_train_pca)):
-        cropped_mask = preprocessed_train[i][1]
+        cropped_mask = preprocessed_train['cropped_mask'][i]
         H, W = cropped_mask.shape
 
         vessel_from_cluster = (binary_labels_train[i].reshape(-1) == 1)
@@ -716,7 +840,7 @@ def apply_fast_classifier_on_nonvessel_pixels(
     refined_test = []
     prob_maps = []
     for i in range(len(X_test_pca)):
-        cropped_mask = preprocessed_test[i][1]
+        cropped_mask = preprocessed_test['cropped_mask'][i]
         H, W = cropped_mask.shape
 
         vessel_from_cluster = (binary_labels_test[i].reshape(-1) == 1)
@@ -740,6 +864,25 @@ def apply_fast_classifier_on_nonvessel_pixels(
 
     return refined_train, refined_test, prob_maps
 
+def combine_results(clustered_test, refined_test, preprocessed_test, clustered_train, refined_train, preprocessed_train):
+    """Combine FCM and FAST results by taking pixel-wise OR."""
+    
+    combined_train = []
+    for i in range(len(clustered_train)):
+        clustered_i = clustered_train[i].reshape(preprocessed_train['cropped_mask'][i].shape).astype(bool)
+        refined_i = refined_train[i].astype(bool)
+        combined = (clustered_i | refined_i).astype(np.uint8) * 255
+        combined_train.append(combined)
+    
+    combined_test = []
+    for i in range(len(clustered_test)):
+        clustered_i = clustered_test[i].reshape(preprocessed_test['cropped_mask'][i].shape).astype(bool)
+        refined_i = refined_test[i].astype(bool)
+        combined = (clustered_i | refined_i).astype(np.uint8) * 255
+        combined_test.append(combined)
+
+    return combined_test, combined_train
+
 def apply_post_processing(refined_train, refined_test, preprocessed_train, preprocessed_test):
     """Apply post-processing to remove FOV border ring and small objects."""
     final_train = []
@@ -747,17 +890,68 @@ def apply_post_processing(refined_train, refined_test, preprocessed_train, prepr
 
     print("Applying post-processing to train data...")
     for i in range(len(refined_train)):
-        cleaned = remove_fov_ring_only(refined_train[i], preprocessed_train[i][1], border_px=12, outside_zero=True)
+        cleaned = remove_fov_ring_only(refined_train[i], preprocessed_train[i], border_px=12, outside_zero=True)
         save_fig12(cleaned, f"results/fig12/train_fig12_{i+21}.png")
         final_train.append(cleaned)
 
     print("Applying post-processing to test data...")
     for i in range(len(refined_test)):
-        cleaned = remove_fov_ring_only(refined_test[i], preprocessed_test[i][1], border_px=12, outside_zero=True)
+        cleaned = remove_fov_ring_only(refined_test[i], preprocessed_test[i], border_px=12, outside_zero=True)
         save_fig12(cleaned, f"results/fig12/test_fig12_{i+1:02d}.png")
         final_test.append(cleaned)
 
     return final_train, final_test
+
+def evaluate_results(final_test, test_gt, preprocessed_test):
+
+    #step1 crop GT to FOV and flatten
+    cropped_gt_test = []
+    for i in range(len(test_gt)):
+        y_min, y_max, x_min, x_max = preprocessed_test['bounds'][i]
+        gt_crop = test_gt[i][y_min:y_max+1, x_min:x_max+1]
+        cropped_gt_test.append(gt_crop.reshape(-1) > 0)
+
+    #step2 calculate tp, fp, fn, tn for each image and average metrics 
+    accuracy_scores = []
+    sensitivities = []
+    specificities = []
+    precision_scores = []
+
+    for i in range(len(final_test)):
+        pred_flat = (final_test[i].reshape(-1) > 0)
+        mask_flat = (preprocessed_test['cropped_mask'][i].reshape(-1) > 0)
+        gt_flat = cropped_gt_test[i]
+
+        tp = np.sum(pred_flat & gt_flat & mask_flat)
+        fp = np.sum(pred_flat & ~gt_flat & mask_flat)
+        fn = np.sum(~pred_flat & gt_flat & mask_flat)
+        tn = np.sum(~pred_flat & ~gt_flat & mask_flat)
+
+        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 1.0
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 1.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 1.0
+        precision_value = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+
+        accuracy_scores.append(accuracy)
+        sensitivities.append(sensitivity)
+        specificities.append(specificity)
+        precision_scores.append(precision_value)
+    
+    Avage_Accuracy = np.mean(accuracy_scores)
+    Avage_Sensitivity = np.mean(sensitivities)
+    Avage_Specificity = np.mean(specificities)
+    Avage_Precision = np.mean(precision_scores)
+
+    #save average metrics as csv 
+    with open("results/metrics.csv", mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Metric", "Value"])
+        writer.writerow(["Average Accuracy", Avage_Accuracy])
+        writer.writerow(["Average Sensitivity", Avage_Sensitivity])
+        writer.writerow(["Average Specificity", Avage_Specificity])
+        writer.writerow(["Average Precision", Avage_Precision])
+
+    return Avage_Accuracy, Avage_Sensitivity, Avage_Specificity, Avage_Precision
 # ========================= SAVING FIGURES ==========================
 
 def save_fig3(G_channel, Y_channel, L_channel, save_path): 
@@ -933,7 +1127,7 @@ gray_gabor_train , gray_gabor_test = gabor_feature_extraction_dataset(preprocess
 Binarize Gabor features using Laplacian enhancement + automatic thresholding.
 For each image, save list of 9 binary Gabor features in a list.
 """
-gabor_train, gabor_test = automatic_thresholding_gabor(gray_gabor_train, gray_gabor_test)
+binary_gabor_train, binary_gabor_test = automatic_thresholding_gabor(gray_gabor_train, gray_gabor_test)
 
 """ 
 Extract TH features for each image in the dataset.
@@ -951,10 +1145,15 @@ sc_train, sc_test = extract_sc_features(preprocessed_train, preprocessed_test)
 Create feature vectors for each image in the dataset.
 For each image, save feature vector of shape (num_pixels, num_features) in a list.
 """
-g_clahe_train = [item[5] for item in preprocessed_train]
-g_clahe_test = [item[5] for item in preprocessed_test]
-feature_vectors_train, feature_vectors_test = create_feature_vector_dataset(gabor_train, th_train, sc_train,gabor_test, th_test, sc_test,g_clahe_train, g_clahe_test)
-
+feature_vectors_train, feature_vectors_test = create_feature_vector_dataset(
+    binary_gabor_train,
+    th_train,
+    sc_train,
+    binary_gabor_test, 
+    th_test, 
+    sc_test, 
+    preprocessed_train['G_clahe'], 
+    preprocessed_test['G_clahe'])
 """ 
 Apply PCA for dimensionality reduction.
 For each image, save reduced feature vector in a list.
@@ -966,25 +1165,33 @@ X_train_pca, X_test_pca = apply_pca(feature_vectors_train, feature_vectors_test)
 Apply Fuzzy C-Means clustering to PCA-reduced feature vectors.
 For each image, save binary cluster labels (vessel=1, non-vessel=0) in a list.
 """
-train_masks = [item[1] for item in preprocessed_train]
-test_masks = [item[1] for item in preprocessed_test]
-binary_labels_train, binary_labels_test = apply_fcm_clustering(X_train_pca, X_test_pca, train_masks, test_masks)
+clustered_train, clustered_test = apply_fcm(X_train_pca, X_test_pca, n_clusters=2, m=2.0, error=1e-6, maxiter=2000, seed=40)
 
 """
 Apply Decision Tree classifier to Non-vessel pixels to detect missed vessels.
 """
-refined_train_masks, refined_test_masks, test_prob_maps = apply_fast_classifier_on_nonvessel_pixels(
+refined_train, refined_test, prob_maps = apply_fast_classifier_on_nonvessel_pixels(
     X_train_pca, X_test_pca,
-    binary_labels_train, binary_labels_test,
+    clustered_train, clustered_test,
     preprocessed_train, preprocessed_test,
     train_gt,
     n_estimators=300,
     samples_per_train_image=4000,
-    prob_threshold=0.5,
+    prob_threshold=0.845,
     random_state=42
 )
 
 """
+Apply pixel-wise OR to combine FCM and FAST results for final vessel segmentation masks.
+"""
+combined_test, combined_train = combine_results(clustered_test, refined_test, preprocessed_test, clustered_train, refined_train, preprocessed_train)
+
+"""
 Apply post-processing to refine vessel segmentation results.
 """
-final_train_masks, final_test_masks = apply_post_processing(refined_train_masks, refined_test_masks, preprocessed_train, preprocessed_test)
+final_train, final_test = apply_post_processing(combined_train, combined_test, preprocessed_train['cropped_mask'], preprocessed_test['cropped_mask'])
+
+"""
+Evaluate final results against ground truth masks using Accuracy, Sensitivity, Specificity, and Precision metrics.
+"""
+average_accuracy, average_sensitivity, average_specificity, average_precision = evaluate_results(final_test, test_gt, preprocessed_test)
