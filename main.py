@@ -44,6 +44,12 @@ def crop_mask(mask, bounds):
     y_min, y_max, x_min, x_max = bounds
     return mask[y_min:y_max+1, x_min:x_max+1]
 
+def fill_outside_fov(image, mask, fill_value):
+    """Fill pixels outside FOV with a specified value."""
+    filled_image = image.copy()
+    filled_image[mask == 0] = fill_value
+    return filled_image
+
 def invert_image(image):
     """Invert grayscale image."""
     if image.dtype != np.uint8:
