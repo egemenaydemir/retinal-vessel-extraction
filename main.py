@@ -1,8 +1,24 @@
+"""
+Retinal Blood Vessel Extraction Pipeline
+----------------------------------------
+Description: Implementation of a hybrid method combining supervised and 
+unsupervised ML for retinal vessel segmentation.
+
+Author: Egemen Aydemir
+Affiliation: Izmir Institute of Technology (IZTECH)
+
+Reference Paper:
+"Retinal blood vessel extraction employing effective image features and 
+combination of supervised and unsupervised machine learning methods"
+Authors: Mahdi Hashemzadeh, Baharak Adlpour Azar 
+Journal: Artificial Intelligence In Medicine, 2019
+DOI: https://doi.org/10.1016/j.artmed.2019.03.001 
+"""
+
 import csv
 import cv2
 import numpy as np 
 from sklearn.decomposition import PCA
-from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import ExtraTreesClassifier
 import skfuzzy as fuzz
